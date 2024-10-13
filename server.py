@@ -14,7 +14,7 @@ if __name__ == "__main__":
 import random
 import argparse
 from argparse import Namespace
-from time import time
+from time import time, sleep
 
 import lib.models
 from lib.models.model_abc import ModelABC
@@ -67,7 +67,7 @@ def format_batch(img_list, bbox_list, req_flip, camera_name_list, cam_intr_map, 
                                  flags=cv2.INTER_LINEAR,
                                  borderMode=cv2.BORDER_CONSTANT)
         
-        cv2.imshow(cam_name, imgcrop[..., ::-1])
+        # cv2.imshow(cam_name, imgcrop[..., ::-1])
 
         image = tvF.to_tensor(imgcrop)
         assert image.shape[0] == 3
@@ -87,7 +87,7 @@ def format_batch(img_list, bbox_list, req_flip, camera_name_list, cam_intr_map, 
         cam_serial_list.append(cam_name)
         cam_intr_list.append(cam_intr)
         cam_extr_list.append(cam_extr)
-    cv2.waitKey(1)
+    # cv2.waitKey(1)
     if len(cam_serial_list) <= 1:
         return None
 
@@ -140,8 +140,20 @@ def main(
     port: int,
 ):
     print("poem-v2 server start")
+    
     # init socket
-    s = socket_util.bind(host, port)
+    s = None
+    _s = time()
+    while time() - _s < 60:
+        try:
+            s = socket_util.bind(host, port)
+            break
+        except OSError:
+            pass
+        print("retrying...")
+        sleep(1)
+    if s is None:
+        raise RuntimeError("socket bind failed!")
 
     # load model
     ## if the model is from the external package
