@@ -54,12 +54,86 @@ import torchvision.transforms.functional as tvF
 from lib.utils.transform import _affine_transform, _affine_transform_post_rot
 
 from transform.transform_jit import inv_transf, transf_point_array
-from transform.transform_np import inv_transf_np, transf_point_array_np
+from transform.transform_np import inv_transf_np, transf_point_array_np, project_point_array_np
 
 from tool.flip_util import flip_cam_extr
 
 
-def bbox_get_center_scale(bbox, expand=2.5, mindim=200):
+def update_bbox_from_joints(res, camera_name_list, cam_intr_map, cam_extr_map, video_shape):
+    """
+    Update bounding box information based on predicted 3D joint positions.
+    
+    Args:
+        res: Dictionary containing prediction results for each hand side ("lh", "rh")
+        camera_name_list: List of camera names
+        cam_intr_map: Dictionary mapping camera names to intrinsic matrices
+        cam_extr_map: Dictionary mapping camera names to extrinsic matrices
+        video_shape: Tuple of (width, height) for the video resolution
+    
+    Returns:
+        bbox_info_new: Dictionary containing updated bounding box information
+    """
+    bbox_info_new = {}
+    for hand_side in ["lh", "rh"]:
+        if res[hand_side] is not None and res[hand_side]["joints"] is not None:
+            # 获取世界坐标系下的3D关节点
+            joints_3d_world = res[hand_side]["joints"]  # shape: (21, 3)
+            bbox_info_new[hand_side] = []
+            
+            # 为每个相机计算新的bbox
+            for cam_name in camera_name_list:
+                cam_intr = cam_intr_map[cam_name]
+                cam_extr = cam_extr_map[cam_name]
+                
+                # 将世界坐标系下的3D点转换到相机坐标系
+                joints_3d_cam = transf_point_array_np(cam_extr, joints_3d_world)
+                
+                # 投影到2D图像平面
+                joints_2d = project_point_array_np(cam_intr, joints_3d_cam)  # shape: (21, 2)
+                
+                # 计算包围盒
+                # 获取有效的2D点（深度大于0）
+                valid_mask = joints_3d_cam[:, 2] > 0
+                if np.sum(valid_mask) > 0:
+                    valid_joints_2d = joints_2d[valid_mask]
+                    
+                    # 计算bbox边界
+                    x_min = np.min(valid_joints_2d[:, 0])
+                    x_max = np.max(valid_joints_2d[:, 0])
+                    y_min = np.min(valid_joints_2d[:, 1])
+                    y_max = np.max(valid_joints_2d[:, 1])
+                    
+                    # 添加边距并确保bbox在图像范围内
+                    margin = 50  # 像素边距
+                    x_min = max(0, x_min - margin)
+                    y_min = max(0, y_min - margin)
+                    x_max = min(video_shape[0] - 1, x_max + margin)  # video_shape[0] is width
+                    y_max = min(video_shape[1] - 1, y_max + margin)  # video_shape[1] is height
+                    
+                    # 确保bbox有最小尺寸
+                    min_size = 100
+                    bbox_w = x_max - x_min
+                    bbox_h = y_max - y_min
+                    if bbox_w < min_size:
+                        center_x = (x_min + x_max) / 2
+                        x_min = max(0, center_x - min_size / 2)
+                        x_max = min(video_shape[0] - 1, center_x + min_size / 2)
+                    if bbox_h < min_size:
+                        center_y = (y_min + y_max) / 2
+                        y_min = max(0, center_y - min_size / 2)
+                        y_max = min(video_shape[1] - 1, center_y + min_size / 2)
+                    
+                    bbox_info_new[hand_side].append([x_min, y_min, x_max, y_max])
+                else:
+                    # 如果没有有效点，使用None
+                    bbox_info_new[hand_side].append(None)
+        else:
+            bbox_info_new[hand_side] = None
+    
+    return bbox_info_new
+
+
+def bbox_get_center_scale(bbox, expand=1.4, mindim=150):
     w, h = float(bbox[2] - bbox[0]), float(bbox[3] - bbox[1])
     s = max(w, h)
     s = s * expand
@@ -99,7 +173,7 @@ def format_batch(img_list, bbox_list, req_flip, camera_name_list, cam_intr_map, 
                                  flags=cv2.INTER_LINEAR,
                                  borderMode=cv2.BORDER_CONSTANT)
 
-        # cv2.imshow(cam_name, imgcrop[..., ::-1])
+        # cv2.imshow(cam_name + '-' + str(req_flip), imgcrop[..., ::-1])
 
         image = tvF.to_tensor(imgcrop)
         assert image.shape[0] == 3
@@ -207,6 +281,8 @@ def control_thread(
             sleep(0.001)
             continue
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"POEM server control error: {e}")
 
 
@@ -354,6 +430,13 @@ def main(
             pub_msg_json = encode_numpy_json(pub_msg)
             pub_socket.send_string(pub_msg_json)
 
+            # update bbox info
+            bbox_info_new = update_bbox_from_joints(res, camera_name_list, cam_intr_map, cam_extr_map, video_shape)
+            
+            # 更新status_dict中的bbox_info，用于下一帧的处理
+            with status_lock:
+                status_dict["bbox_info"] = bbox_info_new
+
         except zmq.Again:
             # No message available - continue
             continue
@@ -364,6 +447,9 @@ def main(
 
         # Small sleep to prevent busy waiting
         sleep(0.001)
+
+    thread_stop_event.set()
+    control_thread_handle.join()
 
     cleanup()
     logger.info("poem-v2 server end")
@@ -387,6 +473,7 @@ if __name__ == "__main__":
 
     # parse camera_info
     camera_info_filepath = getattr(server_arg, "server.camera_info_filepath")
+    logger.info(f"load camera info from {camera_info_filepath}")
     with open(camera_info_filepath, "r") as ifs:
         camera_info = yaml.load(ifs, Loader=yaml.SafeLoader)
     camera_info = camera_info['camera_info']  # index to key
@@ -394,6 +481,7 @@ if __name__ == "__main__":
 
     # load calib
     calib_filedir = getattr(server_arg, "server.calib_filedir")
+    logger.info(f"load calib from {calib_filedir}")
     cam_extr_map, cam_intr_map = {}, {}
     for cam_name in camera_name_list:
         extr_filepath = os.path.join(calib_filedir, "cam_extr", f"{cam_name}.pkl")
