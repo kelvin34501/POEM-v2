@@ -219,6 +219,31 @@ def format_batch(img_list, bbox_list, req_flip, camera_name_list, cam_intr_map, 
     return batch
 
 
+def collate_batch(batch_list):
+    """
+    Simple collate function to merge multiple batches using torch.cat
+    """
+    if not batch_list:
+        return None
+
+    if len(batch_list) == 1:
+        return batch_list[0]
+
+    collated_batch = {}
+
+    collated_batch["image"] = torch.cat([batch["image"] for batch in batch_list], dim=0)
+
+    collated_batch["target_cam_intr"] = torch.cat([batch["target_cam_intr"] for batch in batch_list], dim=0)
+    collated_batch["target_cam_extr"] = torch.cat([batch["target_cam_extr"] for batch in batch_list], dim=0)
+
+    collated_batch["cam_view_num"] = np.concatenate([batch["cam_view_num"] for batch in batch_list], axis=0)
+    collated_batch["cam_serial"] = [batch["cam_serial"][0] for batch in batch_list]
+    collated_batch["master_id"] = torch.cat([batch["master_id"] for batch in batch_list], dim=0)
+    collated_batch["master_serial"] = [batch["master_serial"][0] for batch in batch_list]
+
+    return collated_batch
+
+
 def extract_pred(pred, batch, req_flip, cam_extr_map):
 
     def flip_3d(annot_3d):
@@ -397,6 +422,7 @@ def main(
 
             # process
             res = {}
+            batch_store = {}
             for hand_side in ["lh", "rh"]:
                 if bbox_info.get(hand_side, None) is None:
                     res[hand_side] = None
@@ -410,13 +436,27 @@ def main(
                                      img_size=video_shape,
                                      output_size=cfg.DATA_PRESET.IMAGE_SIZE,
                                      device=device)
-                if batch is None:
-                    payload = None
-                else:
-                    with torch.no_grad():
-                        pred = model(batch, 0, "inference", epoch_idx=0)
-                    payload = extract_pred(pred, batch, req_flip=(hand_side == "lh"), cam_extr_map=cam_extr_map)
+                batch_store[hand_side] = batch
+
+            valid_batches = [b for b in batch_store.values() if b is not None]
+            batch = collate_batch(valid_batches)
+            with torch.no_grad():
+                pred = model(batch, 0, "inference", epoch_idx=0)
+
+            offset = 0
+            for hand_side in ["lh", "rh"]:
+                if batch_store[hand_side] is None:
+                    res[hand_side] = None
+
+                pred_item = {k: v[offset:offset + 1] for k, v in pred.items()}
+
+                payload = extract_pred(pred_item,
+                                       batch_store[hand_side],
+                                       req_flip=(hand_side == "lh"),
+                                       cam_extr_map=cam_extr_map)
                 res[hand_side] = payload
+
+                offset += 1
 
             # reformat res
             pub_msg = {
