@@ -45,10 +45,10 @@ from typing import Dict, Tuple, Optional
 import zmq
 import atexit
 import threading
-from copy import deepcopy
 
 from server_tool.zmq_msg import decode_sync_message
 from server_tool.np_serialize import encode_numpy_json, decode_numpy_json
+import queue
 
 import torch.nn.functional as F
 import torchvision.transforms.functional as tvF
@@ -312,6 +312,135 @@ def control_thread(
             logger.error(f"POEM server control error: {e}")
 
 
+def interpolate_joint3d(joint3d_prev, joint3d_curr, alpha):
+    """
+    Linear interpolation between two joint3d states.
+    
+    Args:
+        joint3d_prev: Previous joint3d dictionary with 'lh' and 'rh' keys
+        joint3d_curr: Current joint3d dictionary with 'lh' and 'rh' keys  
+        alpha: Interpolation factor (0.0 = prev, 1.0 = curr)
+    
+    Returns:
+        Interpolated joint3d dictionary
+    """
+    joint3d_interp = {}
+    for hand_side in ["lh", "rh"]:
+        prev_joints = joint3d_prev.get(hand_side)
+        curr_joints = joint3d_curr.get(hand_side)
+        
+        if prev_joints is None or curr_joints is None:
+            # If either is None, use the non-None one or None if both are None
+            joint3d_interp[hand_side] = curr_joints if curr_joints is not None else prev_joints
+        else:
+            # Linear interpolation
+            joint3d_interp[hand_side] = (1 - alpha) * prev_joints + alpha * curr_joints
+    
+    return joint3d_interp
+
+
+def sending_thread(
+    stop_event,
+    pub_socket,
+    joint3d_queue,
+    send_interval=0.067,  # ~30fps default
+):
+    """
+    Background thread that sends joint3d messages with linear interpolation.
+    
+    Args:
+        stop_event: Threading event to stop the thread
+        pub_socket: ZMQ socket for publishing messages
+        joint3d_queue: Queue containing joint3d_info dictionaries
+        send_interval: Time interval between sends in seconds
+    """
+    logger.info(f"Starting sending thread with {1.0/send_interval:.1f} fps")
+    
+    joint3d_prev = None
+    joint3d_curr = None
+    last_send_time = time()
+    interp_counter = 0
+    last_sent_timestamp = None  # 跟踪最后发送的时间戳，避免重复
+    
+    while not stop_event.is_set():
+        current_time = time()
+        
+        # Try to get new joint3d data from queue
+        try:
+            while True:  # Consume all available messages to get the latest
+                joint3d_info = joint3d_queue.get_nowait()
+                joint3d_prev = joint3d_curr
+                joint3d_curr = joint3d_info
+                joint3d_queue.task_done()
+                interp_counter = 0  # Reset interpolation counter when getting new data
+        except queue.Empty:
+            pass
+        
+        # Check if it's time to send
+        if current_time - last_send_time >= send_interval:
+            if joint3d_curr is not None:
+                # Always send interpolated data based on time progression
+                # This ensures monotonic timestamps
+                if joint3d_prev is not None:
+                    interp_counter += 1
+                    # Stop sending if we've interpolated too many frames without new data
+                    if interp_counter > 5:
+                        # Skip sending but update last_send_time to maintain timing
+                        last_send_time = current_time
+                    else:
+                        # Calculate alpha based on time progression to ensure interpolation (not extrapolation)
+                        # Alpha should be between 0 and 1 for true interpolation
+                        time_diff = joint3d_curr["timestamp"] - joint3d_prev["timestamp"]
+                        if time_diff > 0:
+                            # Calculate the expected time for this interpolated frame
+                            elapsed_since_prev = interp_counter * send_interval * 1000  # convert to ms
+                            alpha = min(elapsed_since_prev / time_diff, 1.0)  # Clamp to [0, 1]
+                        else:
+                            # If timestamps are the same, use a small fixed interpolation
+                            alpha = min(interp_counter * 0.1, 0.5)
+                            print(alpha)
+                        
+                        joint3d_interp = interpolate_joint3d(
+                            joint3d_prev["joint3d"], 
+                            joint3d_curr["joint3d"], 
+                            alpha
+                        )
+                        
+                        # Interpolate timestamp as well (keep as integer)
+                        interp_timestamp = int((1 - alpha) * joint3d_prev["timestamp"] + alpha * joint3d_curr["timestamp"])
+                        
+                        # Send interpolated frame (always mark as interpolated when we have prev data)
+                        interp_msg = {
+                            "timestamp": interp_timestamp,
+                            "joint3d": joint3d_interp,
+                            "bbox": joint3d_curr["bbox"],
+                            "interpolated": True,
+                            "interp_alpha": alpha
+                        }
+                        interp_msg_json = encode_numpy_json(interp_msg)
+                        pub_socket.send_string(interp_msg_json)
+                        last_send_time = current_time
+                else:
+                    # First frame - send as is
+                    joint3d_to_send = joint3d_curr.copy()
+                    joint3d_to_send["interpolated"] = False
+                    send_timestamp = int(joint3d_curr["timestamp"])
+                    
+                    # 确保时间戳不重复
+                    if last_sent_timestamp is not None and send_timestamp <= last_sent_timestamp:
+                        send_timestamp = last_sent_timestamp + 1
+                    
+                    joint3d_to_send["timestamp"] = send_timestamp
+                    pub_msg_json = encode_numpy_json(joint3d_to_send)
+                    pub_socket.send_string(pub_msg_json)
+                    last_send_time = current_time
+                    last_sent_timestamp = send_timestamp
+            
+        sleep(0.001)  # Small sleep to prevent busy waiting
+    
+    logger.info("Sending thread stopped")
+
+
 def main(
     cfg: CN,
     arg: Namespace,
@@ -323,6 +452,7 @@ def main(
     sync_channel: str,
     cmd_channel: str,
     pub_channel: str,
+    send_fps: float = 15.0,
 ):
     logger.info("poem-v2 server start")
 
@@ -381,6 +511,9 @@ def main(
         image_shapes.append((video_shape[1], video_shape[0]))  # Depth
         image_dtypes.append(np.float32)
 
+    # Create queue for joint3d messages
+    joint3d_queue = queue.Queue(maxsize=20)  # Limit queue size to prevent memory buildup
+    
     # process thread
     thread_stop_event = threading.Event()
     status_dict = {'status': 'idle', 'bbox_info': None, 'sync_ts': None}
@@ -389,17 +522,21 @@ def main(
                                              args=(thread_stop_event, cmd_socket, status_dict, status_lock))
     control_thread_handle.daemon = True
     control_thread_handle.start()
+    
+    # Start sending thread  
+    send_interval = 1.0 / send_fps
+    sending_thread_handle = threading.Thread(target=sending_thread,
+                                           args=(thread_stop_event, pub_socket, joint3d_queue, send_interval))
+    sending_thread_handle.daemon = True
+    sending_thread_handle.start()
 
     # start server
     last_timestamp = None
     logger.info("poem server loop")
-    res_last = None
     while True:
         if last_timestamp is not None:
             with status_lock:
                 status_dict['sync_ts'] = last_timestamp  # so control thread will reply only when bbox is in effect
-
-        # time1 = time()
 
         with status_lock:
             status_cur = status_dict.copy()
@@ -462,17 +599,8 @@ def main(
 
                 offset += 1
 
-            res_bkp = deepcopy(res)
-            if res_last is not None:
-                # low pass filter
-                alpha = 0.75
-                for hand_side in ["lh", "rh"]:
-                    if res[hand_side] is not None and res_last[hand_side] is not None:
-                        res[hand_side]["joints"] = alpha * res[hand_side]["joints"] + (
-                            1 - alpha) * res_last[hand_side]["joints"]
-
-            # reformat res
-            pub_msg = {
+            # reformat res and add to queue for sending thread
+            joint3d_info = {
                 "timestamp": timestamp,
                 "joint3d": {
                     "lh": res["lh"]["joints"] if res["lh"] is not None else None,
@@ -480,16 +608,27 @@ def main(
                 },
                 "bbox": bbox_info,
             }
-            pub_msg_json = encode_numpy_json(pub_msg)
-            pub_socket.send_string(pub_msg_json)
+            
+            # Add to queue for sending thread (non-blocking)
+            try:
+                joint3d_queue.put_nowait(joint3d_info)
+            except queue.Full:
+                # If queue is full, remove oldest item and add new one
+                try:
+                    joint3d_queue.get_nowait()
+                    joint3d_queue.put_nowait(joint3d_info)
+                except queue.Empty:
+                    joint3d_queue.put_nowait(joint3d_info)
 
             # update bbox info
             bbox_info_new = update_bbox_from_joints(res, camera_name_list, cam_intr_map, cam_extr_map, video_shape)
-            res_last = res_bkp
 
             # 更新status_dict中的bbox_info，用于下一帧的处理
             with status_lock:
                 status_dict["bbox_info"] = bbox_info_new
+
+            # 更新last_timestamp，确保sync_ts能够正确更新
+            last_timestamp = timestamp
 
         except zmq.Again:
             # No message available - continue
@@ -499,15 +638,12 @@ def main(
             traceback.print_exc()
             logger.error(f"POEM error: {e}")
 
-        time2 = time()
-
-        # print(time2 - time1)
-
         # Small sleep to prevent busy waiting
         sleep(0.001)
 
     thread_stop_event.set()
     control_thread_handle.join()
+    sending_thread_handle.join()
 
     cleanup()
     logger.info("poem-v2 server end")
@@ -525,6 +661,7 @@ if __name__ == "__main__":
     parser.add_argument("--server.sync_channel", type=str, required=True)
     parser.add_argument("--server.cmd_channel", type=str, required=True)
     parser.add_argument("--server.pub_channel", type=str, required=True)
+    parser.add_argument("--server.send_fps", type=float, default=15.0, help="Target FPS for sending interpolated joint3d messages")
     # poem settings
 
     server_arg, _ = parser.parse_known_args()
@@ -558,6 +695,7 @@ if __name__ == "__main__":
     sync_channel = getattr(server_arg, "server.sync_channel")
     cmd_channel = getattr(server_arg, "server.cmd_channel")
     pub_channel = getattr(server_arg, "server.pub_channel")
+    send_fps = getattr(server_arg, "server.send_fps", 15.0)
 
     # poem
     exp_time = time()
@@ -575,4 +713,5 @@ if __name__ == "__main__":
          video_shape=video_shape,
          sync_channel=sync_channel,
          cmd_channel=cmd_channel,
-         pub_channel=pub_channel)
+         pub_channel=pub_channel,
+         send_fps=send_fps)
