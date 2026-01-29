@@ -318,7 +318,7 @@ def main(
     poller.register(cmd_socket, zmq.POLLIN)
     camera_info = None
     calib_filedir = None
-    
+
     while camera_info is None:
         try:
             socks = dict(poller.poll(timeout=100))  # 100ms poll
@@ -518,14 +518,19 @@ def main(
                 },
             }
             pub_socket.send(msgpack.packb(pub_msg, default=msgpack_numpy.encode))
-            
+
             # Mark as processed after successful send
             frame.processed = True
+        except KeyboardInterrupt:
+            logger.info("Received keyboard interrupt, stopping...")
+            break
         except Exception as e:
             import traceback
             traceback.print_exc()
             logger.error(f"POEM error: {e}")
             sleep(0.01)
+
+    cleanup()
 
 
 MODEL_CATEGORY = ['small', 'medium', 'large', 'huge', 'medium_MANO']
@@ -534,7 +539,9 @@ EMBED_SIZE = [128, 256, 512, 1024, 256]
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--server.cmd_channel", type=str, required=True,
+    parser.add_argument("--server.cmd_channel",
+                        type=str,
+                        required=True,
                         help="ZMQ REP channel for receiving config and reporting ready status")
     parser.add_argument("--server.video_shape", type=str, required=True)
     parser.add_argument("--server.sync_channel", type=str, required=True)
