@@ -485,25 +485,48 @@ def main(
             if not valid_batches:
                 continue
 
-            batch = collate_batch(valid_batches)
-            with torch.no_grad():
-                pred = model(batch, 0, "inference", epoch_idx=0)
+            # Check if all valid batches have the same cam_view_num
+            view_nums = [b["cam_view_num"][0] for b in valid_batches]
+            can_collate = len(set(view_nums)) == 1
 
-            offset = 0
-            for hand_side in ["lh", "rh"]:
-                if batch_store[hand_side] is None:
-                    res[hand_side] = None
-                    continue
+            if can_collate:
+                # All batches have the same number of views, use collate for batched inference
+                batch = collate_batch(valid_batches)
+                with torch.no_grad():
+                    pred = model(batch, 0, "inference", epoch_idx=0)
 
-                pred_item = {k: v[offset:offset + 1] for k, v in pred.items()}
+                offset = 0
+                for hand_side in ["lh", "rh"]:
+                    if batch_store[hand_side] is None:
+                        res[hand_side] = None
+                        continue
 
-                payload = extract_pred(pred_item,
-                                       batch_store[hand_side],
-                                       req_flip=(hand_side == "lh"),
-                                       cam_extr_map=cam_extr_map)
-                res[hand_side] = payload
+                    pred_item = {k: v[offset:offset + 1] for k, v in pred.items()}
 
-                offset += 1
+                    payload = extract_pred(pred_item,
+                                           batch_store[hand_side],
+                                           req_flip=(hand_side == "lh"),
+                                           cam_extr_map=cam_extr_map)
+                    res[hand_side] = payload
+
+                    offset += 1
+            else:
+                # Different number of views, process each hand separately
+                for hand_side in ["lh", "rh"]:
+                    if batch_store[hand_side] is None:
+                        res[hand_side] = None
+                        continue
+
+                    with torch.no_grad():
+                        pred = model(batch_store[hand_side], 0, "inference", epoch_idx=0)
+
+                    pred_item = {k: v[0:1] for k, v in pred.items()}
+
+                    payload = extract_pred(pred_item,
+                                           batch_store[hand_side],
+                                           req_flip=(hand_side == "lh"),
+                                           cam_extr_map=cam_extr_map)
+                    res[hand_side] = payload
 
             # reformat res and publish (use sync_timestamp for compatibility with camera_view_recon.py)
             pub_msg = {
