@@ -47,6 +47,7 @@ from typing import Dict, Tuple, Optional, List
 import zmq
 import atexit
 import threading
+from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass
 
@@ -410,6 +411,12 @@ def main(
 
     atexit.register(cleanup)
 
+    # Timing statistics using deque (like WiLoR)
+    frame_count = 0
+    infer_times = deque(maxlen=100)
+    total_times = deque(maxlen=100)
+    LOG_INTERVAL = 30  # Output statistics every 30 frames
+
     while True:
         try:
             # Receive WiLoR results from sub_channel
@@ -423,6 +430,9 @@ def main(
             sub_data = msgpack.unpackb(sub_msg, object_hook=msgpack_numpy.decode, raw=False)
             wilor_ts = sub_data.get("sync_timestamp") or sub_data.get("timestamp")
             bbox_info = sub_data.get("bbox")
+
+            # Start timing for this frame
+            frame_start_time = time()
 
             if bbox_info is None:
                 continue
@@ -489,6 +499,9 @@ def main(
             view_nums = [b["cam_view_num"][0] for b in valid_batches]
             can_collate = len(set(view_nums)) == 1
 
+            # Track inference time
+            infer_start_time = time()
+
             if can_collate:
                 # All batches have the same number of views, use collate for batched inference
                 batch = collate_batch(valid_batches)
@@ -528,6 +541,9 @@ def main(
                                            cam_extr_map=cam_extr_map)
                     res[hand_side] = payload
 
+            # Calculate inference time
+            infer_time = time() - infer_start_time
+
             # reformat res and publish (use sync_timestamp for compatibility with camera_view_recon.py)
             pub_msg = {
                 "sync_timestamp": timestamp,
@@ -541,6 +557,19 @@ def main(
                 },
             }
             pub_socket.send(msgpack.packb(pub_msg, default=msgpack_numpy.encode))
+
+            # Calculate frame processing time and record to deque
+            total_frame_time = time() - frame_start_time
+            frame_count += 1
+            infer_times.append(infer_time * 1000)  # Convert to ms
+            total_times.append(total_frame_time * 1000)  # Convert to ms
+
+            # Log average statistics every LOG_INTERVAL frames
+            if frame_count % LOG_INTERVAL == 0:
+                avg_infer_time = np.mean(infer_times) if infer_times else 0
+                avg_total_time = np.mean(total_times) if total_times else 0
+                logger.info(f"Frame {frame_count} | Infer: {infer_time*1000:.1f}ms (avg: {avg_infer_time:.1f}ms) | "
+                            f"Total: {total_frame_time*1000:.1f}ms (avg: {avg_total_time:.1f}ms)")
 
             # Mark as processed after successful send
             frame.processed = True
