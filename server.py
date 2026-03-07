@@ -42,6 +42,7 @@ import msgpack
 import msgpack_numpy
 import yaml
 import pickle
+import base64
 import json
 from typing import Dict, Tuple, Optional, List
 import zmq
@@ -328,9 +329,13 @@ def main(
                 cmd_data = json.loads(cmd_msg)
                 if cmd_data.get("cmd") == "init":
                     camera_info = cmd_data.get("camera_info", {})
+                    calib_data = cmd_data.get("calib_data", None)
                     calib_filedir = cmd_data.get("calib_filedir", "")
                     logger.info(f"Received camera_info: {camera_info}")
-                    logger.info(f"Received calib_filedir: {calib_filedir}")
+                    if calib_data is not None:
+                        logger.info(f"Received calib_data (base64) for {len(calib_data)} cameras")
+                    else:
+                        logger.info(f"Received calib_filedir: {calib_filedir}")
                 elif cmd_data.get("cmd") == "ping":
                     cmd_socket.send_string(json.dumps({"status": "pong", "msg": "waiting for init"}))
                 else:
@@ -340,15 +345,26 @@ def main(
 
     # Load calib based on received camera_info
     camera_name_list = list(camera_info.values())
-    logger.info(f"Loading calib from {calib_filedir} for cameras: {camera_name_list}")
     cam_extr_map, cam_intr_map = {}, {}
-    for cam_name in camera_name_list:
-        extr_filepath = os.path.join(calib_filedir, "cam_extr", f"{cam_name}.pkl")
-        with open(extr_filepath, "rb") as ifs:
-            cam_extr_map[cam_name] = pickle.load(ifs)
-        intr_filepath = os.path.join(calib_filedir, "cam_intr", f"{cam_name}.pkl")
-        with open(intr_filepath, "rb") as ifs:
-            cam_intr_map[cam_name] = pickle.load(ifs)
+
+    if calib_data is not None:
+        # New protocol: calib data transferred inline via base64-encoded pkl bytes.
+        # Works for both local and remote POEM deployment.
+        logger.info(f"Loading calib from calib_data (base64) for cameras: {camera_name_list}")
+        for cam_name in camera_name_list:
+            entry = calib_data[cam_name]
+            cam_extr_map[cam_name] = pickle.loads(base64.b64decode(entry["extr"]))
+            cam_intr_map[cam_name] = pickle.loads(base64.b64decode(entry["intr"]))
+    else:
+        # Legacy protocol: load from filesystem using calib_filedir path.
+        logger.info(f"Loading calib from {calib_filedir} for cameras: {camera_name_list}")
+        for cam_name in camera_name_list:
+            extr_filepath = os.path.join(calib_filedir, "cam_extr", f"{cam_name}.pkl")
+            with open(extr_filepath, "rb") as ifs:
+                cam_extr_map[cam_name] = pickle.load(ifs)
+            intr_filepath = os.path.join(calib_filedir, "cam_intr", f"{cam_name}.pkl")
+            with open(intr_filepath, "rb") as ifs:
+                cam_intr_map[cam_name] = pickle.load(ifs)
     logger.info(f"Loaded calib for {len(camera_name_list)} cameras")
 
     # Subscribe to synchronized images
