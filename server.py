@@ -47,6 +47,7 @@ import json
 from typing import Dict, Tuple, Optional, List
 import zmq
 import atexit
+import signal
 import threading
 from collections import deque
 from copy import deepcopy
@@ -277,6 +278,20 @@ def main(
 ):
     logger.info("poem-v2 server start")
 
+    # Graceful shutdown flag — set by SIGTERM handler so the main loop can
+    # exit cleanly and run atexit / cleanup.  Without this, Python's default
+    # SIGTERM behaviour terminates immediately *without* running atexit handlers,
+    # and SIGHUP (used by SSH) is even worse.
+    _shutdown_event = threading.Event()
+
+    def _sigterm_handler(signum, frame):
+        sig_name = signal.Signals(signum).name
+        logger.info(f"Received {sig_name}, requesting graceful shutdown...")
+        _shutdown_event.set()
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+    signal.signal(signal.SIGHUP, _sigterm_handler)
+
     # init socket
     from server_tool import zmq_channel_util
 
@@ -435,6 +450,24 @@ def main(
 
     while True:
         try:
+            # --- Check shutdown conditions ------------------------------------
+            # 1) SIGTERM / SIGHUP via signal handler
+            if _shutdown_event.is_set():
+                logger.info("Shutdown flag set (signal), stopping main loop...")
+                break
+
+            # 2) ZMQ shutdown command from master node
+            try:
+                cmd_msg = cmd_socket.recv_string(zmq.NOBLOCK)
+                cmd_data = json.loads(cmd_msg)
+                if cmd_data.get("cmd") == "shutdown":
+                    logger.info("Received shutdown command from master, stopping...")
+                    break
+                else:
+                    logger.debug(f"Ignoring cmd during main loop: {cmd_data}")
+            except zmq.Again:
+                pass
+
             # Receive WiLoR results from sub_channel
             try:
                 sub_msg = sub_socket.recv(zmq.NOBLOCK)
