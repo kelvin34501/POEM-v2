@@ -430,7 +430,13 @@ def main(
     sync_receiver.start()
     logger.info("Sync receiver thread started")
 
+    _cleanup_done = False
+
     def cleanup():
+        nonlocal _cleanup_done
+        if _cleanup_done:
+            return
+        _cleanup_done = True
         sync_receiver.stop()
         sync_receiver.join(timeout=1.0)
         cmd_socket.close()
