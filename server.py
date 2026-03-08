@@ -403,7 +403,7 @@ def main(
     # TimestampBuffer for sync frames (only stores img_list + processed flag)
     frame_buffer: TimestampBuffer[SyncFrameCache] = TimestampBuffer(
         max_frame=60,  # 60 frames buffer
-        match_threshold=0.1,  # 100ms tolerance
+        match_threshold=0.2,  # 200ms tolerance
     )
 
     # Start sync receiver thread
@@ -456,7 +456,11 @@ def main(
             # Find matching frame in buffer
             result = frame_buffer.get_nearest(wilor_ts)
             if result is None:
-                logger.debug(f"No matching frame for wilor_ts={wilor_ts}")
+                frame_buffer_oldest_ts = frame_buffer.oldest_timestamp
+                frame_buffer_newest_ts = frame_buffer.newest_timestamp
+                logger.warning(f"No matching frame for wilor_ts={wilor_ts}, "
+                               f"earliest frame in buffer: {frame_buffer_oldest_ts}, "
+                               f"latest frame in buffer: {frame_buffer_newest_ts}")
                 continue
 
             matched_ts, frame = result
