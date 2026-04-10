@@ -253,16 +253,32 @@ def extract_pred(pred, batch, req_flip, cam_extr_map):
     master_serial = batch["master_serial"][0]
     joint3d_in_master = pred["pred_joints_3d"][0]
     joint3d_in_master_np = joint3d_in_master.detach().cpu().numpy()
+    verts3d_in_master = pred["pred_verts_3d"][0]
+    verts3d_in_master_np = verts3d_in_master.detach().cpu().numpy()
     master_cam_extr = cam_extr_map[master_serial]
     if req_flip:
         master_cam_extr = inv_transf_np(flip_cam_extr(inv_transf_np(master_cam_extr)))
     master_cam_transf = inv_transf_np(master_cam_extr)
     joint3d_in_world_np = transf_point_array_np(master_cam_transf, joint3d_in_master_np)
+    verts3d_in_world_np = transf_point_array_np(master_cam_transf, verts3d_in_master_np)
     if req_flip:
         joint3d_in_world_np = flip_3d(joint3d_in_world_np)
-    return {
+        verts3d_in_world_np = flip_3d(verts3d_in_world_np)
+
+    result = {
         "joints": joint3d_in_world_np,
+        "verts": verts3d_in_world_np,
     }
+
+    # Extract MANO parameters if available (medium_MANO model)
+    if "pred_pose" in pred:
+        mano_pose = pred["pred_pose"][0].detach().cpu().numpy()   # (16, 3) axis-angle
+        result["mano_pose"] = mano_pose
+    if "pred_shape" in pred:
+        mano_shape = pred["pred_shape"][0].detach().cpu().numpy()  # (10,)
+        result["mano_shape"] = mano_shape
+
+    return result
 
 
 def main(
@@ -604,15 +620,24 @@ def main(
             infer_time = time() - infer_start_time
 
             # reformat res and publish (use sync_timestamp for compatibility with camera_view_recon.py)
+            def _build_hand_payload(hand_data):
+                if hand_data is None:
+                    return None
+                payload = {
+                    "joints": hand_data["joints"],
+                    "verts": hand_data["verts"],
+                }
+                if "mano_pose" in hand_data:
+                    payload["mano_pose"] = hand_data["mano_pose"]
+                if "mano_shape" in hand_data:
+                    payload["mano_shape"] = hand_data["mano_shape"]
+                return payload
+
             pub_msg = {
                 "sync_timestamp": timestamp,
                 "pose_3d": {
-                    "lh": {
-                        "joints": res["lh"]["joints"]
-                    } if res["lh"] is not None else None,
-                    "rh": {
-                        "joints": res["rh"]["joints"]
-                    } if res["rh"] is not None else None,
+                    "lh": _build_hand_payload(res["lh"]),
+                    "rh": _build_hand_payload(res["rh"]),
                 },
             }
             pub_socket.send(msgpack.packb(pub_msg, default=msgpack_numpy.encode))
